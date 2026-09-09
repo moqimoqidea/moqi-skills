@@ -1,0 +1,6 @@
+interface:
+  display_name: "主要模型价格比对"
+  short_description: "查询和对比主要厂商的模型版本、服务方式、缓存与官方价格"
+  default_prompt: "Use $model-price to compare every provider and service variant offering the requested model, with current prices and official sources."
+policy:
+  allow_implicit_invocation: true

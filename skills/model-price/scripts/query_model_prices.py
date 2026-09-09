@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import html
 import json
+import os
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Iterable
 
 ALIYUN_URL = (
@@ -39,6 +43,25 @@ KIMI_INDEX_URL = "https://platform.kimi.com/docs/llms.txt"
 ZHIPU_PAGE_URL = "https://bigmodel.cn/pricing"
 ZHIPU_CONFIG_URL = "https://bigmodel.cn/api/biz/operation/query?ids=1160%2C1161"
 MINIMAX_URL = "https://platform.minimaxi.com/docs/guides/pricing-paygo.md"
+OPENAI_URL = "https://developers.openai.com/api/docs/pricing"
+OPENAI_MARKDOWN_URL = f"{OPENAI_URL}.md"
+ANTHROPIC_URL = "https://platform.claude.com/docs/en/about-claude/pricing"
+ANTHROPIC_MARKDOWN_URL = f"{ANTHROPIC_URL}.md"
+GEMINI_URL = "https://ai.google.dev/gemini-api/docs/pricing"
+
+DOMESTIC_PROVIDER_IDS = (
+    "aliyun",
+    "volcengine",
+    "tencent",
+    "deepseek",
+    "kimi",
+    "zhipu",
+    "minimax",
+)
+OVERSEAS_PROVIDER_IDS = ("openai", "anthropic", "google")
+CACHE_TTL = timedelta(hours=3)
+CACHE_SCHEMA_VERSION = 1
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[1] / "cache"
 
 
 def now_iso() -> str:
@@ -164,7 +187,7 @@ class SourceError(RuntimeError):
 class HttpClient:
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
-        self.user_agent = "cn-cloud-model-price/1.0 (public-price-checker)"
+        self.user_agent = "model-price/2.0 (public-price-checker)"
 
     def request(
         self,
@@ -228,6 +251,120 @@ class PriceSource(ABC):
             if model_matches(model, candidate):
                 records.extend(self.query(candidate))
         return records
+
+
+class CacheStore:
+    """Small file cache scoped by provider and operation."""
+
+    def __init__(
+        self,
+        root: Path = DEFAULT_CACHE_DIR,
+        ttl: timedelta = CACHE_TTL,
+        clock: Any = None,
+    ) -> None:
+        self.root = root
+        self.ttl = ttl
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _path(self, provider: str, operation: str, arguments: Any) -> Path:
+        identity = json.dumps(
+            [operation, arguments],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
+        return self.root / provider / f"{operation}-{digest}.json"
+
+    def read(
+        self, provider: str, operation: str, arguments: Any
+    ) -> tuple[Any, str] | None:
+        path = self._path(provider, operation, arguments)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+                return None
+            fetched_at = datetime.fromisoformat(payload["fetched_at"])
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            if self.clock() - fetched_at > self.ttl:
+                return None
+            return payload["data"], payload["fetched_at"]
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def write(self, provider: str, operation: str, arguments: Any, data: Any) -> str:
+        path = self._path(provider, operation, arguments)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fetched_at = self.clock().astimezone().isoformat(timespec="seconds")
+        payload = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "provider": provider,
+            "operation": operation,
+            "arguments": arguments,
+            "fetched_at": fetched_at,
+            "data": data,
+        }
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return fetched_at
+
+
+class CachedPriceSource(PriceSource):
+    """Cache decorator; source adapters stay focused on parsing official data."""
+
+    def __init__(
+        self, source: PriceSource, cache: CacheStore, *, refresh: bool = False
+    ) -> None:
+        self.source = source
+        self.cache = cache
+        self.refresh = refresh
+        self.provider_id = source.provider_id
+        self.provider_name = source.provider_name
+        self.source_url = source.source_url
+        self.source_kind = source.source_kind
+        self.catalog_url = source.catalog_url
+        self.cache_status = "unused"
+        self.cached_at: str | None = None
+
+    def _cached(self, operation: str, arguments: Any, loader: Any) -> Any:
+        if not self.refresh:
+            cached = self.cache.read(self.provider_id, operation, arguments)
+            if cached is not None:
+                data, self.cached_at = cached
+                self.cache_status = "hit"
+                return data
+        try:
+            data = loader()
+        except Exception:
+            self.cache_status = "refresh_failed"
+            raise
+        self.cached_at = self.cache.write(self.provider_id, operation, arguments, data)
+        self.cache_status = "refreshed" if self.refresh else "miss"
+        return data
+
+    def list_models(self, prefix: str = "") -> list[str]:
+        return self._cached(
+            "list", {"prefix": prefix}, lambda: self.source.list_models(prefix)
+        )
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        return self._cached("query", {"model": model}, lambda: self.source.query(model))
+
+    def search(self, model: str, *, exact: bool = False) -> list[dict[str, Any]]:
+        return self._cached(
+            "search",
+            {"model": model, "exact": exact},
+            lambda: self.source.search(model, exact=exact),
+        )
 
 
 ALIYUN_PRICE_TYPES = {
@@ -1301,7 +1438,445 @@ class MiniMaxAdapter(PriceSource):
         ]
 
 
-def build_adapters(client: HttpClient) -> dict[str, PriceSource]:
+def markdown_tables(text: str) -> list[tuple[str, list[list[str]]]]:
+    """Return Markdown tables with their nearest preceding heading."""
+    tables: list[tuple[str, list[list[str]]]] = []
+    heading = ""
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if line.startswith("#"):
+            heading = clean_text(line.lstrip("# "))
+        if (
+            line.startswith("|")
+            and index + 1 < len(lines)
+            and re.match(r"^\s*\|(?:\s*:?-+\s*\|)+\s*$", lines[index + 1])
+        ):
+            rows = [split_markdown_row(line)]
+            index += 2
+            while index < len(lines) and lines[index].lstrip().startswith("|"):
+                rows.append(split_markdown_row(lines[index]))
+                index += 1
+            tables.append((heading, rows))
+            continue
+        index += 1
+    return tables
+
+
+def markdown_link_text(value: str) -> str:
+    return clean_text(re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", value))
+
+
+def usd_amount(value: str) -> str | None:
+    match = re.search(r"\$\s*(\d+(?:\.\d+)?)", value)
+    return match.group(1) if match else None
+
+
+def usd_price(kind: str, label: str, value: str) -> dict[str, Any] | None:
+    amount = usd_amount(value)
+    if not amount:
+        return None
+    return price_item(
+        kind,
+        label,
+        amount,
+        "USD_per_million_tokens",
+        display=clean_text(value),
+    )
+
+
+class OpenAIAdapter(PriceSource):
+    provider_id = "openai"
+    provider_name = "OpenAI"
+    source_url = OPENAI_URL
+    source_kind = "official_markdown"
+
+    def _rows(self) -> list[dict[str, Any]]:
+        text = self.client.get_text(OPENAI_MARKDOWN_URL)
+        rows: list[dict[str, Any]] = []
+        for heading, table in markdown_tables(text):
+            tier_match = re.fullmatch(
+                r"(Standard|Batch|Flex|Fast) pricing data", heading
+            )
+            if not tier_match or len(table) < 2:
+                continue
+            headers = [clean_text(cell).lower() for cell in table[0]]
+            for cells in table[1:]:
+                cells += [""] * (len(headers) - len(cells))
+                display_name = markdown_link_text(cells[0])
+                model_id = re.sub(r"\s*\([^)]*\)\s*$", "", display_name).strip()
+                if not model_id:
+                    continue
+                offers = []
+                for context in ("short", "long"):
+                    prices = []
+                    mappings = {
+                        "input": "input",
+                        "cached input": "cache_hit",
+                        "cache writes": "cache_write",
+                        "output": "output",
+                    }
+                    for suffix, kind in mappings.items():
+                        label = f"{context} context {suffix}"
+                        if label in headers:
+                            item = usd_price(kind, label, cells[headers.index(label)])
+                            if item:
+                                prices.append(item)
+                    if prices:
+                        offers.append(
+                            {
+                                "name": tier_match.group(1).lower(),
+                                "conditions": {
+                                    "service_tier": tier_match.group(1).lower(),
+                                    "context_tier": context,
+                                },
+                                "prices": prices,
+                            }
+                        )
+                rows.append(
+                    {
+                        "model_id": model_id,
+                        "display_name": display_name,
+                        "offers": offers,
+                    }
+                )
+        return rows
+
+    def list_models(self, prefix: str = "") -> list[str]:
+        models = {row["model_id"] for row in self._rows()}
+        if prefix:
+            key = normalize_model(prefix)
+            models = {
+                model for model in models if normalize_model(model).startswith(key)
+            }
+        return sorted(models, key=str.lower)
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        matched = [
+            row
+            for row in self._rows()
+            if normalize_model(row["model_id"]) == normalize_model(model)
+        ]
+        if not matched:
+            return []
+        offers = [offer for row in matched for offer in row["offers"]]
+        return [
+            make_record(
+                self.provider_id,
+                self.provider_name,
+                matched[0]["model_id"],
+                matched[0]["display_name"],
+                "全球",
+                offers,
+                self.source_url,
+                self.source_kind,
+                now_iso(),
+                currency="USD",
+                delivery_mode="first_party",
+                model_family=model_family(matched[0]["model_id"]),
+                source_api=OPENAI_MARKDOWN_URL,
+            )
+        ]
+
+
+class AnthropicAdapter(PriceSource):
+    provider_id = "anthropic"
+    provider_name = "Anthropic"
+    source_url = ANTHROPIC_URL
+    source_kind = "official_markdown"
+
+    def _rows(self) -> list[dict[str, Any]]:
+        text = self.client.get_text(ANTHROPIC_MARKDOWN_URL)
+        tables = markdown_tables(text)
+        table = next(
+            (rows for heading, rows in tables if heading == "Model pricing"),
+            [],
+        )
+        if len(table) < 2:
+            raise SourceError("official model pricing table was not found")
+        rows = []
+        kinds = ["input", "cache_write_5m", "cache_write_1h", "cache_hit", "output"]
+        labels = [
+            "Base input",
+            "5m cache write",
+            "1h cache write",
+            "Cache hit",
+            "Output",
+        ]
+        for cells in table[1:]:
+            cells += [""] * (6 - len(cells))
+            display_name = markdown_link_text(cells[0])
+            model_id = normalize_model(re.sub(r"\s*\([^)]*\)\s*$", "", display_name))
+            if not model_id.startswith("claude-"):
+                continue
+            prices = []
+            for kind, label, value in zip(kinds, labels, cells[1:6]):
+                item = usd_price(kind, label, value)
+                if item:
+                    prices.append(item)
+            conditions: dict[str, Any] = {"service_tier": "standard"}
+            status = re.search(
+                r"\(([^)]*(?:retired|limited availability)[^)]*)\)", display_name, re.I
+            )
+            if status:
+                conditions["status"] = status.group(1)
+            rows.append(
+                {
+                    "model_id": model_id,
+                    "display_name": display_name,
+                    "offer": {
+                        "name": "standard",
+                        "conditions": conditions,
+                        "prices": prices,
+                    },
+                }
+            )
+        for heading, price_table in tables:
+            if heading not in {"Batch processing", "Fast mode pricing"}:
+                continue
+            service_tier = "batch" if heading == "Batch processing" else "fast"
+            for cells in price_table[1:]:
+                cells += [""] * (3 - len(cells))
+                names = markdown_link_text(cells[0]).split(" / ")
+                for name in names:
+                    model_id = normalize_model(
+                        re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+                    )
+                    if not model_id.startswith("claude-"):
+                        continue
+                    prices = [
+                        item
+                        for item in (
+                            usd_price("input", "Input", cells[1]),
+                            usd_price("output", "Output", cells[2]),
+                        )
+                        if item
+                    ]
+                    rows.append(
+                        {
+                            "model_id": model_id,
+                            "display_name": name,
+                            "offer": {
+                                "name": service_tier,
+                                "conditions": {"service_tier": service_tier},
+                                "prices": prices,
+                            },
+                        }
+                    )
+        return rows
+
+    def list_models(self, prefix: str = "") -> list[str]:
+        models = {row["model_id"] for row in self._rows()}
+        if prefix:
+            key = normalize_model(prefix)
+            models = {
+                model for model in models if normalize_model(model).startswith(key)
+            }
+        return sorted(models)
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        matched = [
+            row
+            for row in self._rows()
+            if normalize_model(row["model_id"]) == normalize_model(model)
+        ]
+        if not matched:
+            return []
+        return [
+            make_record(
+                self.provider_id,
+                self.provider_name,
+                matched[0]["model_id"],
+                matched[0]["display_name"],
+                "全球",
+                [row["offer"] for row in matched],
+                self.source_url,
+                self.source_kind,
+                now_iso(),
+                currency="USD",
+                delivery_mode="first_party",
+                model_family=model_family(matched[0]["model_id"]),
+                source_api=ANTHROPIC_MARKDOWN_URL,
+            )
+        ]
+
+
+class GeminiPricingParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_id = ""
+        self.display_name = ""
+        self.tier = ""
+        self.tables: list[dict[str, Any]] = []
+        self.capture: str | None = None
+        self.capture_text: list[str] = []
+        self.in_table = False
+        self.in_cell = False
+        self.cell_text: list[str] = []
+        self.row: list[str] = []
+        self.rows: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag in {"h2", "h3"}:
+            self.capture = tag
+            self.capture_text = []
+            if tag == "h2":
+                heading_id = str(attributes.get("id", ""))
+                self.model_id = heading_id if heading_id.startswith("gemini-") else ""
+                self.display_name = ""
+        if tag == "table" and "pricing-table" in str(attributes.get("class", "")):
+            self.in_table = True
+            self.rows = []
+        elif self.in_table and tag == "tr":
+            self.row = []
+        elif self.in_table and tag in {"td", "th"}:
+            self.in_cell = True
+            self.cell_text = []
+        elif self.in_cell and tag == "br":
+            self.cell_text.append(" / ")
+
+    def handle_data(self, data: str) -> None:
+        if self.capture:
+            self.capture_text.append(data)
+        if self.in_cell:
+            self.cell_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.capture == tag:
+            value = clean_text(" ".join(self.capture_text))
+            if tag == "h2" and self.model_id:
+                self.display_name = value
+            elif tag == "h3":
+                self.tier = value.lower()
+            self.capture = None
+        if self.in_table and tag in {"td", "th"}:
+            self.row.append(clean_text("".join(self.cell_text)))
+            self.in_cell = False
+        elif self.in_table and tag == "tr" and self.row:
+            self.rows.append(self.row)
+        elif self.in_table and tag == "table":
+            if self.model_id and self.rows:
+                self.tables.append(
+                    {
+                        "model_id": self.model_id,
+                        "display_name": self.display_name or self.model_id,
+                        "tier": self.tier or "standard",
+                        "rows": self.rows,
+                    }
+                )
+            self.in_table = False
+
+
+class GeminiAdapter(PriceSource):
+    provider_id = "google"
+    provider_name = "Google Gemini"
+    source_url = GEMINI_URL
+    source_kind = "official_html"
+
+    def _tables(self) -> list[dict[str, Any]]:
+        parser = GeminiPricingParser()
+        parser.feed(self.client.get_text(GEMINI_URL))
+        if not parser.tables:
+            raise SourceError("official pricing tables were not found")
+        return parser.tables
+
+    def list_models(self, prefix: str = "") -> list[str]:
+        models = {table["model_id"] for table in self._tables()}
+        if prefix:
+            key = normalize_model(prefix)
+            models = {
+                model for model in models if normalize_model(model).startswith(key)
+            }
+        return sorted(models)
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        tables = [
+            table
+            for table in self._tables()
+            if normalize_model(table["model_id"]) == normalize_model(model)
+        ]
+        if not tables:
+            return []
+        offers = []
+        type_map = {
+            "input price": "input",
+            "output price": "output",
+            "context caching price": "cache_hit",
+        }
+        for table in tables:
+            headers = [cell.lower() for cell in table["rows"][0]]
+            paid_index = next(
+                (index for index, cell in enumerate(headers) if "paid tier" in cell),
+                None,
+            )
+            if paid_index is None:
+                continue
+            prices = []
+            for row in table["rows"][1:]:
+                if len(row) <= paid_index:
+                    continue
+                label = row[0]
+                kind = next(
+                    (value for key, value in type_map.items() if key in label.lower()),
+                    None,
+                )
+                if not kind:
+                    continue
+                item = usd_price(kind, label, row[paid_index])
+                if item:
+                    prices.append(item)
+                if kind == "cache_hit":
+                    storage = re.search(
+                        r"\$(\d+(?:\.\d+)?)\s*/\s*1,000,000 tokens per hour",
+                        row[paid_index],
+                    )
+                    if storage:
+                        prices.append(
+                            price_item(
+                                "cache_storage",
+                                "Context cache storage",
+                                storage.group(1),
+                                "USD_per_million_tokens_per_hour",
+                                display=row[paid_index],
+                            )
+                        )
+            if prices:
+                offers.append(
+                    {
+                        "name": table["tier"],
+                        "conditions": {
+                            "service_tier": table["tier"],
+                            "billing_tier": "paid",
+                        },
+                        "prices": prices,
+                    }
+                )
+        return [
+            make_record(
+                self.provider_id,
+                self.provider_name,
+                tables[0]["model_id"],
+                tables[0]["display_name"],
+                "全球",
+                offers,
+                self.source_url,
+                self.source_kind,
+                now_iso(),
+                currency="USD",
+                delivery_mode="first_party",
+                model_family=model_family(tables[0]["model_id"]),
+            )
+        ]
+
+
+def build_adapters(
+    client: HttpClient,
+    *,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh: bool = False,
+) -> dict[str, PriceSource]:
     adapters: list[PriceSource] = [
         AliyunAdapter(client),
         VolcengineAdapter(client),
@@ -1310,8 +1885,15 @@ def build_adapters(client: HttpClient) -> dict[str, PriceSource]:
         KimiAdapter(client),
         ZhipuAdapter(client),
         MiniMaxAdapter(client),
+        OpenAIAdapter(client),
+        AnthropicAdapter(client),
+        GeminiAdapter(client),
     ]
-    return {adapter.provider_id: adapter for adapter in adapters}
+    cache = CacheStore(cache_dir)
+    return {
+        adapter.provider_id: CachedPriceSource(adapter, cache, refresh=refresh)
+        for adapter in adapters
+    }
 
 
 def source_status(
@@ -1328,7 +1910,46 @@ def source_status(
     }
     if error:
         item["error"] = error
+    cache_status = getattr(adapter, "cache_status", None)
+    if cache_status and cache_status != "unused":
+        item["cache"] = {
+            "status": cache_status,
+            "fetched_at": getattr(adapter, "cached_at", None),
+        }
     return item
+
+
+def inferred_overseas_providers(model: str) -> tuple[str, ...]:
+    key = normalize_model(model)
+    providers = []
+    if re.search(r"(?:^|-)(?:openai|gpt|chatgpt|codex|sora)(?:-|$)", key) or re.match(
+        r"^o\d(?:-|$)", key
+    ):
+        providers.append("openai")
+    if re.search(r"(?:^|-)(?:anthropic|claude)(?:-|$)", key):
+        providers.append("anthropic")
+    if re.search(r"(?:^|-)(?:google|gemini)(?:-|$)", key):
+        providers.append("google")
+    return tuple(providers)
+
+
+def select_compare_providers(
+    adapters: dict[str, PriceSource],
+    model: str,
+    *,
+    requested: list[str] | None = None,
+    include_overseas: bool = False,
+) -> list[PriceSource]:
+    if requested:
+        provider_ids = requested
+    else:
+        overseas = (
+            OVERSEAS_PROVIDER_IDS
+            if include_overseas
+            else inferred_overseas_providers(model)
+        )
+        provider_ids = [*DOMESTIC_PROVIDER_IDS, *overseas]
+    return [adapters[provider_id] for provider_id in dict.fromkeys(provider_ids)]
 
 
 def query_adapters(
@@ -1370,7 +1991,11 @@ def format_price(item: dict[str, Any] | None) -> str:
     display = item.get("display")
     amount = item.get("amount")
     unit = item.get("unit")
-    if display and "免费" in display:
+    if display and (
+        "免费" in display
+        or len(re.findall(r"\$\s*\d", display)) > 1
+        or re.search(r"\b(?:through|starting)\b", display, re.I)
+    ):
         return display
     if amount is None:
         return display or "—"
@@ -1379,6 +2004,8 @@ def format_price(item: dict[str, Any] | None) -> str:
         "CNY_per_million_tokens_per_hour": "元/百万 tokens/小时",
         "CNY_per_10k_characters": "元/万字符",
         "CNY_per_request": "元/次",
+        "USD_per_million_tokens": "美元/百万 tokens",
+        "USD_per_million_tokens_per_hour": "美元/百万 tokens/小时",
     }
     current = f"{amount} {unit_labels.get(unit, unit)}"
     if item.get("list_amount") is not None:
@@ -1463,9 +2090,16 @@ def to_markdown(payload: dict[str, Any]) -> str:
     for check in payload.get("source_checks", []):
         source = check["source"]
         error = f"；{check['error']}" if check.get("error") else ""
+        cache = check.get("cache")
+        cache_text = (
+            f"；缓存 {cache['status']}，最后拉取 {cache.get('fetched_at') or '未知'}"
+            if cache
+            else ""
+        )
         lines.append(
             f"- {check['provider']['name']}：{labels.get(check['status'], check['status'])}；"
-            f"[{source['kind']}]({source['url']})；检查时间 {source['retrieved_at']}{error}"
+            f"[{source['kind']}]({source['url']})；检查时间 {source['retrieved_at']}"
+            f"{cache_text}{error}"
         )
     return "\n".join(lines) + "\n"
 
@@ -1479,10 +2113,13 @@ def emit(payload: Any, output_format: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Query public Chinese model prices with sources"
+        description="Query official model catalogs and prices with sources"
     )
     parser.add_argument(
         "--timeout", type=int, default=30, help="HTTP timeout in seconds"
+    )
+    parser.add_argument(
+        "--cache-dir", type=Path, default=DEFAULT_CACHE_DIR, help=argparse.SUPPRESS
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1492,6 +2129,22 @@ def main() -> int:
     compare.add_argument("model")
     compare.add_argument(
         "--exact", action="store_true", help="disable model-family matching"
+    )
+    compare.add_argument(
+        "--provider",
+        action="append",
+        dest="providers",
+        help="query only this provider; repeat to compare selected providers",
+    )
+    compare.add_argument(
+        "--include-overseas",
+        action="store_true",
+        help="also query OpenAI, Anthropic, and Google",
+    )
+    compare.add_argument(
+        "--refresh",
+        action="store_true",
+        help="ignore fresh caches for selected providers",
     )
     compare.add_argument("--format", choices=("json", "markdown"), default="json")
 
@@ -1503,25 +2156,41 @@ def main() -> int:
     provider.add_argument(
         "--exact", action="store_true", help="disable model-family matching"
     )
+    provider.add_argument("--refresh", action="store_true", help="ignore fresh cache")
     provider.add_argument("--format", choices=("json", "markdown"), default="json")
 
     listing = subparsers.add_parser("list", help="list model IDs from one provider")
     listing.add_argument("provider")
     listing.add_argument("--prefix", default="")
+    listing.add_argument("--refresh", action="store_true", help="ignore fresh cache")
     listing.add_argument("--format", choices=("json",), default="json")
 
     args = parser.parse_args()
-    adapters = build_adapters(HttpClient(args.timeout))
+    adapters = build_adapters(
+        HttpClient(args.timeout), cache_dir=args.cache_dir, refresh=args.refresh
+    )
     selected_provider = getattr(args, "provider", None)
     if selected_provider is not None and selected_provider not in adapters:
         parser.error(
             f"unknown provider: {selected_provider}; choose from {', '.join(adapters)}"
         )
+    requested = getattr(args, "providers", None)
+    invalid = [
+        provider_id for provider_id in requested or [] if provider_id not in adapters
+    ]
+    if invalid:
+        parser.error(
+            f"unknown provider: {', '.join(invalid)}; choose from {', '.join(adapters)}"
+        )
 
     if args.command == "compare":
-        emit(
-            query_adapters(adapters.values(), args.model, exact=args.exact), args.format
+        selected = select_compare_providers(
+            adapters,
+            args.model,
+            requested=args.providers,
+            include_overseas=args.include_overseas,
         )
+        emit(query_adapters(selected, args.model, exact=args.exact), args.format)
     elif args.command == "provider":
         emit(
             query_adapters([adapters[args.provider]], args.model, exact=args.exact),
@@ -1543,6 +2212,12 @@ def main() -> int:
                     "retrieved_at": checked_at,
                 },
             }
+            cache_status = getattr(adapter, "cache_status", None)
+            if cache_status and cache_status != "unused":
+                payload["cache"] = {
+                    "status": cache_status,
+                    "fetched_at": getattr(adapter, "cached_at", None),
+                }
         except Exception as exc:
             payload = source_status(adapter, "source_error", checked_at, str(exc))
         emit(payload, args.format)

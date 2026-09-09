@@ -19,7 +19,7 @@ needs them.
 
 | Skill | Description |
 | --- | --- |
-| [cn-cloud-model-price](cn-cloud-model-price/SKILL.md) | Query and compare public China-region model prices across Aliyun, Volcengine, Tencent Cloud, DeepSeek, Kimi, Zhipu, and MiniMax. |
+| [model-price](model-price/SKILL.md) | Query and compare major models and official prices across Chinese cloud platforms, OpenAI, Anthropic, and Google Gemini. |
 
 ## Adding a new skill
 

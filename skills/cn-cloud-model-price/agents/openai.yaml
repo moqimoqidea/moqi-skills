@@ -1,6 +1,0 @@
-interface:
-  display_name: "中国模型价格比对"
-  short_description: "查询模型在国内平台的版本、服务方式和官方价格"
-  default_prompt: "Use $cn-cloud-model-price to compare every provider and service variant offering deepseek-v4-pro, with current prices and official sources."
-policy:
-  allow_implicit_invocation: true
