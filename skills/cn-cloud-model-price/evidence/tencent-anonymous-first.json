@@ -1,5 +1,0 @@
-{
-  "code": 7,
-  "message": "登录态验证失败，请重新登录(UIN_OR_SKEY_MISSING)",
-  "conclusion": "腾讯控制台 DescribeModelList 不是匿名接口；运行时使用官方公开文档。"
-}

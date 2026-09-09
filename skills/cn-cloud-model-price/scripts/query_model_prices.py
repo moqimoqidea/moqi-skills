@@ -21,16 +21,16 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Iterable
 
-
 ALIYUN_URL = (
     "https://bailian-cs.console.aliyun.com/data/api.json"
     "?action=BroadScopeAspnGateway&product=sfm_bailian"
     "&api=zeldaHttp.dashscopeModel./zelda/api/v1/modelCenter/listFoundationModels"
     "&_v=undefined"
 )
-VOLCENGINE_URL = (
-    "https://arkbff-cn-beijing.console.volcengine.com/"
-    "api/2024-10-01/GetModelSquareTopData"
+VOLCENGINE_PAGE_URL = "https://docs.volcengine.com/docs/82379/1544106"
+VOLCENGINE_DOC_API = (
+    "https://docs.volcengine.com/api/doc/getDocDetail"
+    "?DocumentID=1544106&LibraryID=82379&lang=zh"
 )
 TENCENT_LIST_URL = "https://cloud.tencent.com/document/product/1823/130051"
 TENCENT_PRICE_URL = "https://cloud.tencent.com/document/product/1823/130055"
@@ -49,6 +49,35 @@ def normalize_model(value: str) -> str:
     value = html.unescape(value).strip().lower().replace("_", "-")
     value = re.sub(r"\s+", "-", value)
     return re.sub(r"-+", "-", value)
+
+
+def model_family(value: str) -> str:
+    """Return a comparison key while preserving meaningful model versions."""
+    value = clean_text(value).lower()
+    value = re.sub(r"\b(?:原厂直供|正式版|预览版)\b", "", value)
+    value = value.replace("原厂直供", "").replace("正式版", "").replace("预览版", "")
+    return normalize_model(value).strip("-").rsplit("/", 1)[-1]
+
+
+def model_matches(query: str, candidate: str, *, exact: bool = False) -> bool:
+    query_key = normalize_model(query)
+    candidate_key = normalize_model(candidate)
+    if exact:
+        return candidate_key == query_key
+    family = model_family(candidate)
+    query_family = model_family(query)
+    keys = {candidate_key, family, family.rsplit("/", 1)[-1]}
+    return any(
+        key == query_key
+        or key == query_family
+        or key.startswith(f"{query_key}-")
+        or key.startswith(f"{query_family}-")
+        for key in keys
+    )
+
+
+def tencent_delivery_mode(display_name: str) -> str:
+    return "upstream_direct" if "原厂直供" in display_name else "self_deployed"
 
 
 def clean_text(value: str) -> str:
@@ -160,18 +189,6 @@ class HttpClient:
     def get_text(self, url: str) -> str:
         return self.request(url)
 
-    def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        text = self.request(
-            url,
-            method="POST",
-            data=json.dumps(payload, ensure_ascii=False).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise SourceError("source did not return JSON") from exc
-
     def post_form(self, url: str, fields: dict[str, str]) -> dict[str, Any]:
         text = self.request(
             url,
@@ -202,6 +219,15 @@ class PriceSource(ABC):
     @abstractmethod
     def list_models(self, prefix: str = "") -> list[str]:
         raise NotImplementedError
+
+    def search(self, model: str, *, exact: bool = False) -> list[dict[str, Any]]:
+        if exact:
+            return self.query(model)
+        records: list[dict[str, Any]] = []
+        for candidate in self.list_models():
+            if model_matches(model, candidate):
+                records.extend(self.query(candidate))
+        return records
 
 
 ALIYUN_PRICE_TYPES = {
@@ -247,7 +273,10 @@ class AliyunAdapter(PriceSource):
             total = int(data.get("total", 0))
             for item in data.get("list", []):
                 model = item.get("model")
-                if model and (not prefix or normalize_model(model).startswith(normalize_model(prefix))):
+                if model and (
+                    not prefix
+                    or normalize_model(model).startswith(normalize_model(prefix))
+                ):
                     models.add(model)
             page += 1
             if page > 100:
@@ -264,16 +293,26 @@ class AliyunAdapter(PriceSource):
         for item in candidates:
             if normalize_model(item.get("model", "")) != normalize_model(model):
                 continue
-            prices = [
-                price_item(
-                    ALIYUN_PRICE_TYPES.get(p.get("type"), p.get("type", "other")),
-                    p.get("priceName", p.get("type", "价格")),
-                    str(p["price"]) if p.get("price") is not None else None,
-                    unit_code(p.get("priceUnit", "")),
-                    discount=p.get("discount"),
+            grouped_prices: dict[str, list[dict[str, Any]]] = {}
+            for price in item.get("prices", []):
+                band = price.get("timeBand") or "standard"
+                grouped_prices.setdefault(band, []).append(
+                    price_item(
+                        ALIYUN_PRICE_TYPES.get(
+                            price.get("type"), price.get("type", "other")
+                        ),
+                        price.get("priceName", price.get("type", "价格")),
+                        str(price["price"]) if price.get("price") is not None else None,
+                        unit_code(price.get("priceUnit", "")),
+                        discount=price.get("discount"),
+                    )
                 )
-                for p in item.get("prices", [])
-            ]
+            offers = []
+            for band, prices in grouped_prices.items():
+                conditions = {} if band == "standard" else {"time_band": band}
+                offers.append(
+                    {"name": band, "conditions": conditions, "prices": prices}
+                )
             result.append(
                 make_record(
                     self.provider_id,
@@ -281,130 +320,253 @@ class AliyunAdapter(PriceSource):
                     item["model"],
                     item.get("name", item["model"]),
                     "中国区",
-                    [{"name": "online_standard", "conditions": {}, "prices": prices}],
+                    offers,
                     self.source_url,
                     self.source_kind,
                     retrieved_at,
                     price_time_bands=item.get("priceTimeBands", []),
                     service_sites=item.get("serviceSites", []),
+                    delivery_mode=(
+                        "platform_hosted"
+                        if item.get("inferenceProvider") == "aliyun-bailian"
+                        else "third_party_hosted"
+                    ),
+                    inference_provider=item.get("inferenceProvider"),
+                    access_scope=item.get("scope"),
+                    model_family=model_family(item["model"]),
                 )
             )
         return result
 
 
-VOLC_PRICE_TYPES = {
-    "InferencePrompt": "input",
-    "InferenceCompletion": "output",
-    "ContextSessionHit": "cache_hit",
-    "ContextSessionStorage": "cache_storage",
-    "BatchInferencePrompt": "batch_input",
-    "BatchInferenceCompletion": "batch_output",
-    "BatchInferenceCacheHit": "batch_cache_hit",
-}
+class VolcDocument:
+    """Read Volcengine's structured document JSON and its embedded tables."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        try:
+            result = payload["Result"]
+            if result.get("ContentType") != "json":
+                raise SourceError("Volcengine pricing document is not structured JSON")
+            content = json.loads(result["Content"])
+            self.data = content["data"]
+            self.updated_at = result.get("UpdatedTime")
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise SourceError("unexpected Volcengine document response") from exc
+
+    def _text(self, zone_id: str, seen: set[str] | None = None) -> str:
+        seen = set() if seen is None else seen
+        if zone_id in seen:
+            return ""
+        seen.add(zone_id)
+        pieces = []
+        for op in self.data.get(zone_id, {}).get("ops", []):
+            value = op.get("insert", "")
+            if isinstance(value, str):
+                if value == "*" and op.get("attributes", {}).get("lineId"):
+                    continue
+                pieces.append(value)
+            elif isinstance(value, dict) and value.get("id"):
+                pieces.append(self._text(value["id"], seen))
+        raw = "".join(pieces)
+        return "\n".join(
+            line for line in (clean_text(line) for line in raw.splitlines()) if line
+        )
+
+    def _table(self, reference: str) -> list[list[str]]:
+        try:
+            row_zone, column_zone = reference.split()[:2]
+            rows = [
+                op["insert"]["id"]
+                for op in self.data[row_zone]["ops"]
+                if isinstance(op.get("insert"), dict) and op["insert"].get("id")
+            ]
+            columns = [
+                op["insert"]["id"]
+                for op in self.data[column_zone]["ops"]
+                if isinstance(op.get("insert"), dict) and op["insert"].get("id")
+            ]
+        except (KeyError, ValueError) as exc:
+            raise SourceError("unexpected Volcengine table structure") from exc
+        return [
+            [self._text(f"x{row_id}x{column_id}") for column_id in columns]
+            for row_id in rows
+        ]
+
+    def tables(self) -> Iterable[tuple[list[str], list[list[str]]]]:
+        headings: list[str] = []
+        pending_level: int | None = None
+        try:
+            operations = self.data["0"]["ops"]
+        except (KeyError, TypeError) as exc:
+            raise SourceError("Volcengine document root was not found") from exc
+        for op in operations:
+            attributes = op.get("attributes", {})
+            heading = attributes.get("heading")
+            if isinstance(heading, str) and heading.startswith("h"):
+                pending_level = int(heading[1:])
+            value = op.get("insert")
+            if (
+                pending_level
+                and isinstance(value, str)
+                and value.strip() not in ("", "*")
+            ):
+                title = clean_text(value)
+                headings = headings[: pending_level - 1]
+                headings.append(title)
+                pending_level = None
+            if attributes.get("aceTable"):
+                yield list(headings), self._table(attributes["aceTable"])
+
+
+def volc_offer_name(headings: list[str]) -> str:
+    title = " / ".join(headings)
+    if "低延迟" in title:
+        return "online_low_latency"
+    if "批量推理" in title:
+        return "batch"
+    if "TPM" in title:
+        return "tpm_package"
+    return "online_standard"
+
+
+def price_type_from_header(header: str) -> str:
+    compact = clean_text(header).replace(" ", "")
+    if "缓存存储" in compact:
+        return "cache_storage"
+    if "缓存命中" in compact and "音频" in compact and "非音频" not in compact:
+        return "audio_cache_hit"
+    if "缓存命中" in compact:
+        return "cache_hit"
+    if "输入" in compact and "音频" in compact and "非音频" not in compact:
+        return "audio_input"
+    if "输入" in compact:
+        return "input"
+    if "输出" in compact:
+        return "output"
+    return "other"
+
+
+def amount_from_cell(value: str) -> str | None:
+    if clean_text(value) in ("", "-"):
+        return None
+    values = numeric_values(value)
+    return values[-1] if values else None
 
 
 class VolcengineAdapter(PriceSource):
     provider_id = "volcengine"
     provider_name = "火山引擎方舟"
-    source_url = VOLCENGINE_URL
-    source_kind = "anonymous_api"
+    source_url = VOLCENGINE_PAGE_URL
+    source_kind = "official_document_json"
+    catalog_url = VOLCENGINE_PAGE_URL
 
-    def _bundle(self) -> dict[str, Any]:
-        return self.client.post_json(
-            VOLCENGINE_URL, {"viewType": "detail", "modules": ["pricing"]}
-        )
+    def _document(self) -> VolcDocument:
+        return VolcDocument(json.loads(self.client.get_text(VOLCENGINE_DOC_API)))
 
-    @staticmethod
-    def _pricing_nodes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
-        try:
-            return bundle["Result"]["clientDetail"]["pricing"]
-        except (KeyError, TypeError) as exc:
-            raise SourceError("unexpected Volcengine response shape") from exc
-
-    def list_models(self, prefix: str = "") -> list[str]:
-        models = {
-            node["selection"]["modelId"]
-            for node in self._pricing_nodes(self._bundle())
-            if node.get("selection", {}).get("modelId")
-        }
-        if prefix:
-            normalized = normalize_model(prefix)
-            models = {m for m in models if normalize_model(m).startswith(normalized)}
-        return sorted(models, key=str.lower)
-
-    def query(self, model: str) -> list[dict[str, Any]]:
-        catalog = self._pricing_nodes(self._bundle())
-        exact = [
-            node["selection"]
-            for node in catalog
-            if normalize_model(node.get("selection", {}).get("modelId", ""))
-            == normalize_model(model)
-        ]
-        if not exact:
-            by_name = [
-                node["selection"]
-                for node in catalog
-                if normalize_model(node.get("selection", {}).get("modelName", ""))
-                == normalize_model(model)
-            ]
-            if len(by_name) == 1:
-                exact = by_name
-        if not exact:
-            return []
-        selection = exact[0]
-        payload = {
-            "viewType": "detail",
-            "selections": [
-                {
-                    "modelName": selection["modelName"],
-                    "modelVersion": selection["modelVersion"],
-                }
-            ],
-            "modules": ["pricing"],
-        }
+    def _records(self) -> list[dict[str, Any]]:
+        document = self._document()
         retrieved_at = now_iso()
-        nodes = self._pricing_nodes(self.client.post_json(VOLCENGINE_URL, payload))
-        records = []
-        for node in nodes:
-            selected = node.get("selection", {})
-            if selected.get("modelId") != selection.get("modelId"):
+        grouped: dict[str, dict[str, Any]] = {}
+        for headings, table in document.tables():
+            if len(table) < 2:
                 continue
-            offers = []
-            segments = node.get("section", {}).get("pricing", {}).get("segments", [])
-            for segment in segments:
+            headers = table[0]
+            model_index = next(
+                (
+                    i
+                    for i, header in enumerate(headers)
+                    if clean_text(header) in ("模型", "模型名称")
+                ),
+                None,
+            )
+            if model_index is None or not any(
+                price_type_from_header(h) != "other" for h in headers
+            ):
+                continue
+            condition_index = next(
+                (i for i, header in enumerate(headers) if "条件" in clean_text(header)),
+                None,
+            )
+            current_model_cell = ""
+            for row in table[1:]:
+                if model_index >= len(row):
+                    continue
+                raw_model_cell = row[model_index]
+                if clean_text(raw_model_cell):
+                    current_model_cell = raw_model_cell
+                if not current_model_cell or "不适用" in current_model_cell:
+                    continue
+                display_name = clean_text(current_model_cell.splitlines()[0])
                 prices = []
-                for item in segment.get("items", []):
-                    raw_type = item.get("key", "").split(":")[-1]
-                    prices.append(
-                        price_item(
-                            VOLC_PRICE_TYPES.get(raw_type, raw_type or "other"),
-                            item.get("label", raw_type),
-                            str(item["value"]) if item.get("value") is not None else None,
-                            unit_code(item.get("unit", "")),
+                for index, header in enumerate(headers):
+                    kind = price_type_from_header(header)
+                    if kind == "other" or index >= len(row):
+                        continue
+                    amount = amount_from_cell(row[index])
+                    if amount is not None:
+                        prices.append(
+                            price_item(
+                                kind, clean_text(header), amount, unit_code(header)
+                            )
                         )
-                    )
-                offers.append(
+                if not prices:
+                    continue
+                conditions: dict[str, Any] = {}
+                if condition_index is not None and condition_index < len(row):
+                    condition = clean_text(row[condition_index])
+                    if condition not in ("", "-"):
+                        conditions["context_tier"] = condition
+                stage = "preview" if "预览版" in display_name else "stable"
+                conditions["release_stage"] = stage
+                key = normalize_model(display_name)
+                record = grouped.setdefault(
+                    key,
+                    make_record(
+                        self.provider_id,
+                        self.provider_name,
+                        key,
+                        display_name,
+                        "中国区",
+                        [],
+                        self.source_url,
+                        self.source_kind,
+                        retrieved_at,
+                        source_api=VOLCENGINE_DOC_API,
+                        source_updated_at=document.updated_at,
+                        delivery_mode="platform_hosted",
+                        model_family=model_family(display_name),
+                    ),
+                )
+                record["offers"].append(
                     {
-                        "name": segment.get("key", "default"),
-                        "label": segment.get("label", "默认"),
-                        "conditions": {},
+                        "name": volc_offer_name(headings),
+                        "conditions": conditions,
                         "prices": prices,
                     }
                 )
-            records.append(
-                make_record(
-                    self.provider_id,
-                    self.provider_name,
-                    selected["modelId"],
-                    selected["modelId"],
-                    "中国区（北京）",
-                    offers,
-                    self.source_url,
-                    self.source_kind,
-                    retrieved_at,
-                )
-            )
-        return records
+        return list(grouped.values())
+
+    def list_models(self, prefix: str = "") -> list[str]:
+        models = {record["display_name"] for record in self._records()}
+        if prefix:
+            models = {model for model in models if model_matches(prefix, model)}
+        return sorted(models, key=str.lower)
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self._records()
+            if model_matches(model, record["model_id"], exact=True)
+            or model_matches(model, record["display_name"], exact=True)
+        ]
+
+    def search(self, model: str, *, exact: bool = False) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self._records()
+            if model_matches(model, record["model_id"], exact=exact)
+            or model_matches(model, record["display_name"], exact=exact)
+        ]
 
 
 def extract_tencent_slate(page: str) -> list[dict[str, Any]]:
@@ -417,7 +579,9 @@ def extract_tencent_slate(page: str) -> list[dict[str, Any]]:
         raise SourceError("Tencent document state was not found")
     try:
         state = json.loads(json.loads(match.group("quoted")))
-        slate: Any = state["loaderData"]["product-article"]["data"]["article"]["content"]["slate"]
+        slate: Any = state["loaderData"]["product-article"]["data"]["article"][
+            "content"
+        ]["slate"]
         for _ in range(3):
             if not isinstance(slate, str):
                 break
@@ -459,13 +623,13 @@ def walk_objects(node: Any) -> Iterable[dict[str, Any]]:
 
 def expand_slate_table(table: dict[str, Any]) -> list[list[str]]:
     grid: list[list[str]] = []
-    spans: dict[int, tuple[int, str]] = {}
+    spans: dict[int, list[Any]] = {}
     for raw_row in table.get("children", []):
         if raw_row.get("type") != "row":
             continue
         row: list[str | None] = []
 
-        def fill_spans_through(column: int) -> None:
+        def consume_span(column: int) -> None:
             while len(row) <= column:
                 row.append(None)
             if column in spans and row[column] is None:
@@ -479,8 +643,13 @@ def expand_slate_table(table: dict[str, Any]) -> list[list[str]]:
         column = 0
         cells = [c for c in raw_row.get("children", []) if c.get("type") == "cell"]
         for cell in cells:
+            is_placeholder = cell.get("rowSpan") == 0 and cell.get("colSpan") == 0
+            if is_placeholder:
+                consume_span(column)
+                column += 1
+                continue
             while column in spans:
-                fill_spans_through(column)
+                consume_span(column)
                 column += 1
             value = cell_text(cell)
             colspan = max(1, int(cell.get("colSpan", 1)))
@@ -490,11 +659,11 @@ def expand_slate_table(table: dict[str, Any]) -> list[list[str]]:
                     row.append(None)
                 row[column + offset] = value
                 if rowspan > 1:
-                    spans[column + offset] = (rowspan - 1, value)
+                    spans[column + offset] = [rowspan - 1, value]
             column += colspan
-        if spans:
-            for position in sorted(list(spans)):
-                fill_spans_through(position)
+        for position in sorted(list(spans)):
+            if position >= column:
+                consume_span(position)
         grid.append([value or "" for value in row])
     return grid
 
@@ -506,9 +675,9 @@ class TencentAdapter(PriceSource):
     source_kind = "official_document"
     catalog_url = TENCENT_LIST_URL
 
-    def _catalog(self) -> list[tuple[str, str]]:
+    def _catalog(self) -> list[dict[str, str]]:
         slate = extract_tencent_slate(self.client.get_text(TENCENT_LIST_URL))
-        pairs: list[tuple[str, str]] = []
+        entries: list[dict[str, str]] = []
         for node in walk_objects(slate):
             if node.get("type") != "table":
                 continue
@@ -518,7 +687,9 @@ class TencentAdapter(PriceSource):
             headers = rows[0]
             try:
                 name_index = next(i for i, h in enumerate(headers) if h == "模型名称")
-                id_index = next(i for i, h in enumerate(headers) if "model（调用参数）" in h)
+                id_index = next(
+                    i for i, h in enumerate(headers) if "model（调用参数）" in h
+                )
             except StopIteration:
                 continue
             for row in rows[1:]:
@@ -527,31 +698,27 @@ class TencentAdapter(PriceSource):
                 for model_id in row[id_index].splitlines():
                     model_id = model_id.strip()
                     if model_id:
-                        pairs.append((model_id, row[name_index].strip()))
-        return pairs
+                        display_name = row[name_index].strip()
+                        entries.append(
+                            {
+                                "model_id": model_id,
+                                "display_name": display_name,
+                                "delivery_mode": tencent_delivery_mode(display_name),
+                            }
+                        )
+        return entries
 
     def list_models(self, prefix: str = "") -> list[str]:
-        models = {model_id for model_id, _ in self._catalog()}
+        models = {entry["model_id"] for entry in self._catalog()}
         if prefix:
             normalized = normalize_model(prefix)
             models = {m for m in models if normalize_model(m).startswith(normalized)}
         return sorted(models, key=str.lower)
 
-    def query(self, model: str) -> list[dict[str, Any]]:
-        catalog = self._catalog()
-        matches = [pair for pair in catalog if normalize_model(pair[0]) == normalize_model(model)]
-        if not matches:
-            display_matches = [
-                pair for pair in catalog if normalize_model(pair[1]) == normalize_model(model)
-            ]
-            if len(display_matches) == 1:
-                matches = display_matches
-        if not matches:
-            return []
-        model_id, display_name = matches[0]
+    def _price_offers(self) -> dict[str, list[dict[str, Any]]]:
         retrieved_at = now_iso()
         slate = extract_tencent_slate(self.client.get_text(TENCENT_PRICE_URL))
-        offers = []
+        offers_by_name: dict[str, list[dict[str, Any]]] = {}
         for node in walk_objects(slate):
             if node.get("type") != "tab" or node.get("name") != "广州":
                 continue
@@ -580,12 +747,17 @@ class TencentAdapter(PriceSource):
                     name_pos = indexes["name"]
                     if name_pos is None or name_pos >= len(row):
                         continue
-                    if normalize_model(row[name_pos]) != normalize_model(display_name):
+                    display_name = clean_text(row[name_pos])
+                    if not display_name:
                         continue
                     prices = []
                     for kind in ("input", "output", "cache_hit"):
                         position = indexes[kind]
-                        if position is None or position >= len(row) or row[position] in ("", "-"):
+                        if (
+                            position is None
+                            or position >= len(row)
+                            or row[position] in ("", "-")
+                        ):
                             continue
                         prices.append(
                             price_item(
@@ -598,29 +770,82 @@ class TencentAdapter(PriceSource):
                     conditions = {}
                     for key in ("condition", "time_band"):
                         position = indexes[key]
-                        if position is not None and position < len(row) and row[position] not in ("", "-"):
+                        if (
+                            position is not None
+                            and position < len(row)
+                            and row[position] not in ("", "-")
+                        ):
                             conditions[key] = row[position]
-                    offers.append(
+                    if not prices:
+                        continue
+                    offers_by_name.setdefault(normalize_model(display_name), []).append(
                         {
-                            "name": "online_standard" if not conditions else "online_conditional",
+                            "name": (
+                                "online_standard"
+                                if not conditions
+                                else "online_conditional"
+                            ),
                             "conditions": conditions,
                             "prices": prices,
                         }
                     )
-        if not offers:
-            return []
+        return offers_by_name
+
+    def _records(self) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for entry in self._catalog():
+            grouped.setdefault(normalize_model(entry["display_name"]), []).append(entry)
+        offers_by_name = self._price_offers()
+        retrieved_at = now_iso()
+        records = []
+        for name_key, entries in grouped.items():
+            offers = offers_by_name.get(name_key, [])
+            if not offers:
+                continue
+            aliases = sorted(
+                {entry["model_id"] for entry in entries},
+                key=lambda value: (len(value), value),
+            )
+            display_name = entries[0]["display_name"]
+            records.append(
+                make_record(
+                    self.provider_id,
+                    self.provider_name,
+                    aliases[0],
+                    display_name,
+                    "中国区（广州）",
+                    offers,
+                    self.source_url,
+                    self.source_kind,
+                    retrieved_at,
+                    catalog_url=TENCENT_LIST_URL,
+                    model_aliases=aliases,
+                    delivery_mode=entries[0]["delivery_mode"],
+                    model_family=model_family(display_name),
+                )
+            )
+        return records
+
+    def query(self, model: str) -> list[dict[str, Any]]:
+        query_key = normalize_model(model)
         return [
-            make_record(
-                self.provider_id,
-                self.provider_name,
-                model_id,
-                display_name,
-                "中国区（广州）",
-                offers,
-                self.source_url,
-                self.source_kind,
-                retrieved_at,
-                catalog_url=TENCENT_LIST_URL,
+            record
+            for record in self._records()
+            if query_key
+            in {
+                normalize_model(record["display_name"]),
+                *map(normalize_model, record["model_aliases"]),
+            }
+        ]
+
+    def search(self, model: str, *, exact: bool = False) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self._records()
+            if model_matches(model, record["display_name"], exact=exact)
+            or any(
+                model_matches(model, alias, exact=exact)
+                for alias in record["model_aliases"]
             )
         ]
 
@@ -669,7 +894,9 @@ class DeepSeekAdapter(PriceSource):
     def _table(self) -> list[list[str]]:
         parser = TextTableParser()
         parser.feed(self.client.get_text(DEEPSEEK_URL).replace("\x00", ""))
-        table = next((t for t in parser.tables if t and t[0] and t[0][0] == "模型"), None)
+        table = next(
+            (t for t in parser.tables if t and t[0] and t[0][0] == "模型"), None
+        )
         if not table:
             raise SourceError("DeepSeek pricing table was not found")
         return table
@@ -685,7 +912,11 @@ class DeepSeekAdapter(PriceSource):
         table = self._table()
         models = table[0][1:]
         try:
-            model_index = next(i for i, item in enumerate(models) if normalize_model(item) == normalize_model(model))
+            model_index = next(
+                i
+                for i, item in enumerate(models)
+                if normalize_model(item) == normalize_model(model)
+            )
         except StopIteration:
             return []
         type_map = {
@@ -698,14 +929,20 @@ class DeepSeekAdapter(PriceSource):
         current_label = ""
         for row in table:
             joined = " ".join(row)
-            detected = next((value for label, value in type_map.items() if label in joined), None)
+            detected = next(
+                (value for label, value in type_map.items() if label in joined), None
+            )
             if detected:
                 current_kind = detected
                 current_label = next(label for label in type_map if label in joined)
             band = next((b for b in ("空闲时段", "高峰时段") if b in row), None)
             if not band or not current_kind:
                 continue
-            amounts = [re.sub(r"元$", "", value) for value in row if re.fullmatch(r"\d+(?:\.\d+)?元", value)]
+            amounts = [
+                re.sub(r"元$", "", value)
+                for value in row
+                if re.fullmatch(r"\d+(?:\.\d+)?元", value)
+            ]
             if len(amounts) != len(models):
                 continue
             offer = offers.setdefault(
@@ -741,6 +978,8 @@ class DeepSeekAdapter(PriceSource):
                 self.source_url,
                 self.source_kind,
                 now_iso(),
+                delivery_mode="first_party",
+                model_family=model_family(models[model_index]),
             )
         ]
 
@@ -774,7 +1013,9 @@ class KimiAdapter(PriceSource):
         return [(url, self.client.get_text(url)) for url in dict.fromkeys(urls)]
 
     def list_models(self, prefix: str = "") -> list[str]:
-        models = {row[0] for _, doc in self._documents() for row in markdown_json_rows(doc)}
+        models = {
+            row[0] for _, doc in self._documents() for row in markdown_json_rows(doc)
+        }
         if prefix:
             normalized = normalize_model(prefix)
             models = {m for m in models if normalize_model(m).startswith(normalized)}
@@ -787,8 +1028,18 @@ class KimiAdapter(PriceSource):
                     continue
                 amounts = [re.sub(r"^[¥￥]", "", value) for value in row[2:5]]
                 prices = [
-                    price_item("cache_hit", "输入（缓存命中）", amounts[0], "CNY_per_million_tokens"),
-                    price_item("input", "输入（缓存未命中）", amounts[1], "CNY_per_million_tokens"),
+                    price_item(
+                        "cache_hit",
+                        "输入（缓存命中）",
+                        amounts[0],
+                        "CNY_per_million_tokens",
+                    ),
+                    price_item(
+                        "input",
+                        "输入（缓存未命中）",
+                        amounts[1],
+                        "CNY_per_million_tokens",
+                    ),
                     price_item("output", "输出", amounts[2], "CNY_per_million_tokens"),
                 ]
                 return [
@@ -798,10 +1049,18 @@ class KimiAdapter(PriceSource):
                         row[0],
                         row[0],
                         "中国区",
-                        [{"name": "online_standard", "conditions": {}, "prices": prices}],
+                        [
+                            {
+                                "name": "online_standard",
+                                "conditions": {},
+                                "prices": prices,
+                            }
+                        ],
                         url,
                         self.source_kind,
                         now_iso(),
+                        delivery_mode="first_party",
+                        model_family=model_family(row[0]),
                     )
                 ]
         return []
@@ -811,13 +1070,16 @@ def parse_display_price(value: str, label: str) -> dict[str, Any]:
     cleaned = clean_text(value)
     values = numeric_values(value)
     if "免费" in cleaned:
-        return price_item(
-            "other", label, "0", unit_code(value), display=cleaned
-        )
+        return price_item("other", label, "0", unit_code(value), display=cleaned)
     amount = values[-1] if values else None
     list_amount = values[0] if len(values) > 1 else None
     return price_item(
-        "other", label, amount, unit_code(value), display=cleaned, list_amount=list_amount
+        "other",
+        label,
+        amount,
+        unit_code(value),
+        display=cleaned,
+        list_amount=list_amount,
     )
 
 
@@ -849,14 +1111,21 @@ class ZhipuAdapter(PriceSource):
                     continue
                 for card in tab.get("cards", []):
                     values = [
-                        (field.get("label", ""), " / ".join(map(str, field.get("values", []))))
+                        (
+                            field.get("label", ""),
+                            " / ".join(map(str, field.get("values", []))),
+                        )
                         for field in card.get("fieldList", [])
                     ]
                     cards.append({**card, "values": values})
         return cards
 
     def list_models(self, prefix: str = "") -> list[str]:
-        models = {normalize_model(card.get("title", "")) for card in self._cards() if card.get("title")}
+        models = {
+            normalize_model(card.get("title", ""))
+            for card in self._cards()
+            if card.get("title")
+        }
         if prefix:
             normalized = normalize_model(prefix)
             models = {m for m in models if m.startswith(normalized)}
@@ -864,7 +1133,11 @@ class ZhipuAdapter(PriceSource):
 
     def query(self, model: str) -> list[dict[str, Any]]:
         card = next(
-            (c for c in self._cards() if normalize_model(c.get("title", "")) == normalize_model(model)),
+            (
+                c
+                for c in self._cards()
+                if normalize_model(c.get("title", "")) == normalize_model(model)
+            ),
             None,
         )
         if not card:
@@ -897,12 +1170,20 @@ class ZhipuAdapter(PriceSource):
                 normalize_model(card["title"]),
                 card["title"],
                 "中国区",
-                [{"name": "online_standard", "conditions": conditions, "prices": prices}],
+                [
+                    {
+                        "name": "online_standard",
+                        "conditions": conditions,
+                        "prices": prices,
+                    }
+                ],
                 self.source_url,
                 self.source_kind,
                 now_iso(),
                 config_url=ZHIPU_CONFIG_URL,
                 notes=notes,
+                delivery_mode="first_party",
+                model_family=model_family(card["title"]),
             )
         ]
 
@@ -929,7 +1210,7 @@ class MiniMaxAdapter(PriceSource):
                 tier = "priority" if tab.group(1) == "优先*" else "standard"
             if "</Tabs>" in line:
                 tier = "standard"
-            if "<Accordion title=\"历史模型\">" in line:
+            if '<Accordion title="历史模型">' in line:
                 historical = True
             if "</Accordion>" in line:
                 historical = False
@@ -982,7 +1263,11 @@ class MiniMaxAdapter(PriceSource):
         return sorted(models, key=str.lower)
 
     def query(self, model: str) -> list[dict[str, Any]]:
-        matched = [row for row in self._rows() if normalize_model(row["model"]) == normalize_model(model)]
+        matched = [
+            row
+            for row in self._rows()
+            if normalize_model(row["model"]) == normalize_model(model)
+        ]
         if not matched:
             return []
         offers = []
@@ -1010,6 +1295,8 @@ class MiniMaxAdapter(PriceSource):
                 self.source_url,
                 self.source_kind,
                 now_iso(),
+                delivery_mode="first_party",
+                model_family=model_family(matched[0]["model"]),
             )
         ]
 
@@ -1027,7 +1314,9 @@ def build_adapters(client: HttpClient) -> dict[str, PriceSource]:
     return {adapter.provider_id: adapter for adapter in adapters}
 
 
-def source_status(adapter: PriceSource, status: str, retrieved_at: str, error: str | None = None) -> dict[str, Any]:
+def source_status(
+    adapter: PriceSource, status: str, retrieved_at: str, error: str | None = None
+) -> dict[str, Any]:
     item: dict[str, Any] = {
         "provider": {"id": adapter.provider_id, "name": adapter.provider_name},
         "status": status,
@@ -1042,23 +1331,37 @@ def source_status(adapter: PriceSource, status: str, retrieved_at: str, error: s
     return item
 
 
-def query_adapters(adapters: Iterable[PriceSource], model: str) -> dict[str, Any]:
+def query_adapters(
+    adapters: Iterable[PriceSource], model: str, *, exact: bool = False
+) -> dict[str, Any]:
     started = now_iso()
     records = []
     checks = []
     for adapter in adapters:
         checked_at = now_iso()
         try:
-            found = adapter.query(model)
+            found = adapter.search(model, exact=exact)
             records.extend(found)
-            checks.append(source_status(adapter, "available" if found else "not_found", checked_at))
+            checks.append(
+                source_status(
+                    adapter, "available" if found else "not_found", checked_at
+                )
+            )
         except Exception as exc:  # keep other providers usable when one source changes
             checks.append(source_status(adapter, "source_error", checked_at, str(exc)))
-    return {"query": model, "retrieved_at": started, "results": records, "source_checks": checks}
+    return {
+        "query": model,
+        "match_mode": "exact" if exact else "model_family",
+        "retrieved_at": started,
+        "results": records,
+        "source_checks": checks,
+    }
 
 
 def price_lookup(offer: dict[str, Any], kind: str) -> dict[str, Any] | None:
-    return next((item for item in offer.get("prices", []) if item.get("type") == kind), None)
+    return next(
+        (item for item in offer.get("prices", []) if item.get("type") == kind), None
+    )
 
 
 def format_price(item: dict[str, Any] | None) -> str:
@@ -1090,8 +1393,12 @@ def format_other_prices(offer: dict[str, Any]) -> str:
         if item.get("type") in core:
             continue
         value = format_price(item)
-        discount = f"，discount={item['discount']}" if item.get("discount") is not None else ""
-        items.append(f"{item.get('label', item.get('type', '价格'))}: {value}{discount}")
+        discount = (
+            f"，discount={item['discount']}" if item.get("discount") is not None else ""
+        )
+        items.append(
+            f"{item.get('label', item.get('type', '价格'))}: {value}{discount}"
+        )
     return "；".join(items) or "—"
 
 
@@ -1106,33 +1413,53 @@ def to_markdown(payload: dict[str, Any]) -> str:
     if results:
         lines.extend(
             [
-                "| 厂商 | 模型 ID | 地域 | 计费条件 | 输入 | 输出 | 缓存命中 | 缓存写入/存储 | 其他价格 | 来源 |",
-                "|---|---|---|---|---:|---:|---:|---:|---|---|",
+                "| 厂商 | 模型/版本 | 服务方式 | 地域 | 计费条件 | 输入 | 输出 | 缓存命中 | 缓存写入/存储 | 其他价格 | 来源 |",
+                "|---|---|---|---|---|---:|---:|---:|---:|---|---|",
             ]
         )
+        delivery_labels = {
+            "platform_hosted": "平台托管",
+            "self_deployed": "自部署",
+            "upstream_direct": "原厂直供",
+            "third_party_hosted": "第三方托管",
+            "first_party": "原厂",
+        }
         for record in results:
             for offer in record.get("offers", []):
                 conditions = offer.get("conditions", {})
-                condition_text = "；".join(f"{k}={v}" for k, v in conditions.items()) or offer.get("name", "标准")
+                details = [offer.get("name", "标准")]
+                details.extend(f"{k}={v}" for k, v in conditions.items())
+                condition_text = "；".join(filter(None, details))
                 source = record["source"]["url"]
                 lines.append(
-                    "| {provider} | `{model}` | {region} | {conditions} | {input} | {output} | {cache} | {storage} | {other} | [官方来源]({source}) |".format(
+                    "| {provider} | {model} | {delivery} | {region} | {conditions} | {input} | {output} | {cache} | {storage} | {other} | [官方来源]({source}) |".format(
                         provider=record["provider"]["name"],
-                        model=record["model_id"],
+                        model=f"{record.get('display_name', record['model_id'])} (`{record['model_id']}`)",
+                        delivery=delivery_labels.get(
+                            record.get("delivery_mode"),
+                            record.get("delivery_mode", "—"),
+                        ),
                         region=record["region"],
                         conditions=condition_text.replace("|", "\\|"),
                         input=format_price(price_lookup(offer, "input")),
                         output=format_price(price_lookup(offer, "output")),
                         cache=format_price(price_lookup(offer, "cache_hit")),
-                        storage=format_price(price_lookup(offer, "cache_write") or price_lookup(offer, "cache_storage")),
+                        storage=format_price(
+                            price_lookup(offer, "cache_write")
+                            or price_lookup(offer, "cache_storage")
+                        ),
                         other=format_other_prices(offer).replace("|", "\\|"),
                         source=source,
                     )
                 )
     else:
-        lines.append("没有来源确认提供这个精确模型 ID。")
+        lines.append("没有来源确认提供匹配的模型或版本。")
     lines.extend(["", "## 来源检查", ""])
-    labels = {"available": "已找到", "not_found": "未找到精确模型", "source_error": "来源解析失败"}
+    labels = {
+        "available": "已找到",
+        "not_found": "未找到匹配模型",
+        "source_error": "来源解析失败",
+    }
     for check in payload.get("source_checks", []):
         source = check["source"]
         error = f"；{check['error']}" if check.get("error") else ""
@@ -1151,17 +1478,31 @@ def emit(payload: Any, output_format: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Query public Chinese model prices with sources")
-    parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
+    parser = argparse.ArgumentParser(
+        description="Query public Chinese model prices with sources"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="HTTP timeout in seconds"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    compare = subparsers.add_parser("compare", help="compare one exact model across all providers")
+    compare = subparsers.add_parser(
+        "compare", help="compare a model family across all providers"
+    )
     compare.add_argument("model")
+    compare.add_argument(
+        "--exact", action="store_true", help="disable model-family matching"
+    )
     compare.add_argument("--format", choices=("json", "markdown"), default="json")
 
-    provider = subparsers.add_parser("provider", help="query one provider for one exact model")
+    provider = subparsers.add_parser(
+        "provider", help="query a model family from one provider"
+    )
     provider.add_argument("provider")
     provider.add_argument("model")
+    provider.add_argument(
+        "--exact", action="store_true", help="disable model-family matching"
+    )
     provider.add_argument("--format", choices=("json", "markdown"), default="json")
 
     listing = subparsers.add_parser("list", help="list model IDs from one provider")
@@ -1173,12 +1514,19 @@ def main() -> int:
     adapters = build_adapters(HttpClient(args.timeout))
     selected_provider = getattr(args, "provider", None)
     if selected_provider is not None and selected_provider not in adapters:
-        parser.error(f"unknown provider: {selected_provider}; choose from {', '.join(adapters)}")
+        parser.error(
+            f"unknown provider: {selected_provider}; choose from {', '.join(adapters)}"
+        )
 
     if args.command == "compare":
-        emit(query_adapters(adapters.values(), args.model), args.format)
+        emit(
+            query_adapters(adapters.values(), args.model, exact=args.exact), args.format
+        )
     elif args.command == "provider":
-        emit(query_adapters([adapters[args.provider]], args.model), args.format)
+        emit(
+            query_adapters([adapters[args.provider]], args.model, exact=args.exact),
+            args.format,
+        )
     else:
         adapter = adapters[args.provider]
         checked_at = now_iso()
