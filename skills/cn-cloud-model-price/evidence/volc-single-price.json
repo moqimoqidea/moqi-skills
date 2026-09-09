@@ -1,0 +1,73 @@
+{
+  "source": "anonymous_api",
+  "endpoint": "https://arkbff-cn-beijing.console.volcengine.com/api/2024-10-01/GetModelSquareTopData",
+  "request": {
+    "viewType": "detail",
+    "selections": [
+      {
+        "modelName": "doubao-seed-2-1-pro",
+        "modelVersion": "260628"
+      }
+    ],
+    "modules": [
+      "pricing"
+    ]
+  },
+  "selection": {
+    "modelName": "doubao-seed-2-1-pro",
+    "modelVersion": "260628",
+    "modelId": "doubao-seed-2-1-pro-260628"
+  },
+  "pricing": {
+    "segments": [
+      {
+        "key": "default",
+        "label": "默认",
+        "items": [
+          {
+            "key": "default:InferencePrompt",
+            "label": "推理输入",
+            "value": "6",
+            "unit": "元/百万tokens"
+          },
+          {
+            "key": "default:InferenceCompletion",
+            "label": "推理输出",
+            "value": "30",
+            "unit": "元/百万tokens"
+          },
+          {
+            "key": "default:ContextSessionHit",
+            "label": "缓存命中",
+            "value": "1.2",
+            "unit": "元/百万tokens"
+          },
+          {
+            "key": "default:ContextSessionStorage",
+            "label": "缓存存储",
+            "value": "0.017",
+            "unit": "元/百万tokens/小时"
+          },
+          {
+            "key": "default:BatchInferencePrompt",
+            "label": "批量推理输入",
+            "value": "3",
+            "unit": "元/百万tokens"
+          },
+          {
+            "key": "default:BatchInferenceCompletion",
+            "label": "批量推理输出",
+            "value": "15",
+            "unit": "元/百万tokens"
+          },
+          {
+            "key": "default:BatchInferenceCacheHit",
+            "label": "批量推理缓存命中",
+            "value": "1.2",
+            "unit": "元/百万tokens"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+interface:
+  display_name: "中国模型价格比对"
+  short_description: "查询国内模型价格、缓存计费并附官方来源"
+  default_prompt: "Use $cn-cloud-model-price to compare which providers offer glm-5.3, including cache pricing and official sources."
+policy:
+  allow_implicit_invocation: true
+

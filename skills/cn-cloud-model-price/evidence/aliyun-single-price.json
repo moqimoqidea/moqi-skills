@@ -1,0 +1,237 @@
+{
+  "total": 1,
+  "pageNo": 1,
+  "pageSize": 10,
+  "list": [
+    {
+      "inferenceMetadata": {
+        "response_modality": [
+          "Text"
+        ],
+        "request_modality": [
+          "Image",
+          "Text",
+          "Video"
+        ]
+      },
+      "applyType": 0,
+      "builtInToolMultiPrices": [
+        {
+          "supportedApi": "Responses API",
+          "name": "code_interpreter",
+          "docUrl": "https://help.aliyun.com/document_detail/2990719.html",
+          "type": "code_interpreter",
+          "prices": [
+            {
+              "priceUnit": "",
+              "price": "0",
+              "currency": "CNY"
+            }
+          ]
+        },
+        {
+          "supportedApi": "Responses API",
+          "name": "web_extractor",
+          "docUrl": "https://help.aliyun.com/document_detail/3016816.html",
+          "type": "web_extractor",
+          "prices": [
+            {
+              "priceUnit": "",
+              "price": "0",
+              "currency": "CNY"
+            }
+          ]
+        },
+        {
+          "supportedApi": "Responses API",
+          "name": "web_search",
+          "docUrl": "https://help.aliyun.com/document_detail/2867560.html",
+          "type": "web_search",
+          "prices": [
+            {
+              "priceUnit": "千次调用",
+              "price": "4",
+              "currency": "CNY"
+            }
+          ]
+        },
+        {
+          "supportedApi": "Responses API",
+          "name": "i2i_search",
+          "docUrl": "https://help.aliyun.com/document_detail/3022096.html",
+          "type": "i2i_search",
+          "prices": [
+            {
+              "priceUnit": "千次调用",
+              "price": "48",
+              "currency": "CNY"
+            }
+          ]
+        },
+        {
+          "supportedApi": "Responses API",
+          "name": "t2i_search",
+          "docUrl": "https://help.aliyun.com/document_detail/3022091.html",
+          "type": "t2i_search",
+          "prices": [
+            {
+              "priceUnit": "千次调用",
+              "price": "24",
+              "currency": "CNY"
+            }
+          ]
+        },
+        {
+          "supportedApi": "Completions API",
+          "name": "pdf_parsing",
+          "docUrl": "https://help.aliyun.com/document_detail/3048937.html",
+          "type": "pdf_parsing",
+          "prices": [
+            {
+              "priceUnit": "每页",
+              "price": "0.02",
+              "currency": "CNY"
+            }
+          ]
+        }
+      ],
+      "updateAt": "2026-08-02T04:14:32.000+00:00",
+      "description": "2.4万亿参数MoE旗舰，编程与办公能力全面跃升，可自主编程十数天交付完整项目。胜任法律、金融、设计等数百种专业任务，一次对话端到端交付生产级成果。原生视觉理解贯穿规划、执行与验证全流程，支持超长文档与长视频的深度语义解析。长程任务中自主规划与闭环迭代，持续进化。",
+      "aliyunRecommend": true,
+      "collectionTag": "qwen3.8",
+      "features": [
+        "cache",
+        "function-calling",
+        "model-experience",
+        "prefix-completion",
+        "structured-outputs",
+        "web-search",
+        "batch"
+      ],
+      "modelInfo": {
+        "contextWindow": 1000000,
+        "maxInputTokens": 991808,
+        "maxReasoningTokens": 262144,
+        "reasoningMaxInputTokens": 983616,
+        "maxOutputTokens": 131072,
+        "reasoningMaxOutputTokens": 131072
+      },
+      "provider": "qwen",
+      "permissions": {},
+      "quota": {},
+      "scope": "PUBLIC",
+      "providerIconUrl": "https://img.alicdn.com/imgextra/i4/O1CN01hyyjfo1dPw5ZyrL8g_!!6000000003729-55-tps-40-40.svg",
+      "supports": {
+        "sft": false,
+        "dpo": false,
+        "inference": true,
+        "workflow": false,
+        "cpt": false,
+        "managedAgents": true,
+        "experience": true,
+        "displayQpmLimit": true,
+        "deploy": true,
+        "sellingByQpm": false,
+        "workflowText": true,
+        "experienceV2": true,
+        "eval": false,
+        "experienceUpcoming": false,
+        "appV2": true,
+        "appV1": true,
+        "autoTPM": true
+      },
+      "model": "qwen3.8-max",
+      "prices": [
+        {
+          "priceUnit": "每百万tokens",
+          "price": "12",
+          "ntmAmountType": "input_token",
+          "type": "input_token",
+          "priceName": "输入"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "36",
+          "ntmAmountType": "output_token",
+          "type": "output_token",
+          "priceName": "输出"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "1.5",
+          "ntmAmountType": "input_token_cache",
+          "type": "input_token_cache",
+          "priceName": "输入（缓存命中）"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "6",
+          "ntmAmountType": "input_token_batch",
+          "type": "input_token_batch",
+          "priceName": "输入（Batch File）"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "18",
+          "ntmAmountType": "output_token_batch",
+          "type": "output_token_batch",
+          "priceName": "输出（Batch File）"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "15",
+          "ntmAmountType": "input_token_cache_creation_5m",
+          "type": "input_token_cache_creation_5m",
+          "priceName": "显式缓存创建"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "1",
+          "ntmAmountType": "input_token_cache_read",
+          "type": "input_token_cache_read",
+          "priceName": "显式缓存命中"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "12",
+          "discount": 0.5,
+          "ntmAmountType": "input_token_batch",
+          "type": "input_token_batch_chat",
+          "priceName": "输入（Batch Chat)"
+        },
+        {
+          "priceUnit": "每百万tokens",
+          "price": "36",
+          "discount": 0.5,
+          "ntmAmountType": "output_token_batch",
+          "type": "output_token_batch_chat",
+          "priceName": "输出（Batch Chat)"
+        }
+      ],
+      "serviceSites": [
+        "asia-pacific-china"
+      ],
+      "priceTimeBands": [],
+      "capabilities": [
+        "Reasoning",
+        "VU",
+        "TG"
+      ],
+      "activationStatus": 0,
+      "modelAlias": "qwen3.8-max",
+      "versionTag": "MAJOR",
+      "shortDescription": "2.4万亿参数MoE旗舰，编程与办公能力全面跃升，可自主编程十数天交付完整项目。胜任法律、金融、设计等数百种专业任务，一次对话端到端交付生产级成果。原生视觉理解贯穿规划、执行与验证全流程，支持超长文档与长视频的深度语义解析。长程任务中自主规划与闭环迭代，持续进化。",
+      "maxOutputTokens": 131072,
+      "latestOnlineAt": "2026-08-02T04:14:32.000+00:00",
+      "tags": [],
+      "license": {},
+      "contextWindow": 1000000,
+      "maxInputTokens": 991808,
+      "inferenceProvider": "aliyun-bailian",
+      "name": "Qwen3.8-Max",
+      "docUrl": "https://help.aliyun.com/document_detail/3016807.html",
+      "needApply": false,
+      "category": "Flagship"
+    }
+  ]
+}

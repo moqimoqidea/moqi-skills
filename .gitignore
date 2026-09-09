@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+__MACOSX/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Editors
+.vscode/
+.idea/
+
+# Logs & temp
+*.log
+.env
