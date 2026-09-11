@@ -29,6 +29,8 @@ Each provider caches lists and price searches independently under `cache/`. Fres
 
 Use family matching for availability comparisons; use `--exact` only for an exact official ID. Never merge self-deployed, platform-hosted, third-party-hosted, upstream-direct, first-party, Batch, cache, context, service-tier, time-band, promotion, version, currency, or region variants.
 
+Model identity ignores documentation footnote markers (`deepseek-flash(1)` == `deepseek-flash`). Officially retired names are mapped to their live model, so `deepseek-v4-flash` resolves to `deepseek-flash`; always report the `model_id` actually returned. A model that is listed but priced per second, per request, or only on a free tier produces no price rows — say so rather than reporting a price of zero.
+
 Prefer an official structured JSON response used by a documentation page. Fall back to official Markdown or HTML only when no public JSON source exists. Never use credentials or private console data.
 
 Read [references/schema.md](references/schema.md) when consuming JSON. Read [references/source-notes.md](references/source-notes.md) only when a source or parser needs maintenance.

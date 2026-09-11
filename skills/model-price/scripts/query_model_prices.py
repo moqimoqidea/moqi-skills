@@ -68,10 +68,42 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+FOOTNOTE_MARKER_RE = re.compile(r"\s*[（(]\s*\d+\s*[)）]\s*$")
+
+# Retired names that official docs still serve. Aliases only ever add matches;
+# they never remove one, so family expansion for live names keeps working.
+RETIRED_MODEL_ALIASES = {
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek/deepseek-v4-flash-vision-exp": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+}
+
+
+def strip_footnote_markers(value: str) -> str:
+    """Drop trailing citation markers such as ``deepseek-flash(1)``.
+
+    Vendor docs annotate model columns with footnote numbers. Those markers are
+    presentation only, so they must never take part in model identity.
+    """
+    result = value
+    while True:
+        stripped = FOOTNOTE_MARKER_RE.sub("", result).strip()
+        if stripped == result:
+            return stripped
+        result = stripped
+
+
 def normalize_model(value: str) -> str:
-    value = html.unescape(value).strip().lower().replace("_", "-")
+    value = strip_footnote_markers(html.unescape(value))
+    value = value.strip().lower().replace("_", "-")
     value = re.sub(r"\s+", "-", value)
     return re.sub(r"-+", "-", value)
+
+
+def model_key(value: str) -> str:
+    """Normalize a model name and follow documented retired-name aliases."""
+    key = normalize_model(value)
+    return RETIRED_MODEL_ALIASES.get(key, key)
 
 
 def model_family(value: str) -> str:
@@ -82,7 +114,7 @@ def model_family(value: str) -> str:
     return normalize_model(value).strip("-").rsplit("/", 1)[-1]
 
 
-def model_matches(query: str, candidate: str, *, exact: bool = False) -> bool:
+def _raw_model_matches(query: str, candidate: str, *, exact: bool = False) -> bool:
     query_key = normalize_model(query)
     candidate_key = normalize_model(candidate)
     if exact:
@@ -97,6 +129,15 @@ def model_matches(query: str, candidate: str, *, exact: bool = False) -> bool:
         or key.startswith(f"{query_family}-")
         for key in keys
     )
+
+
+def model_matches(query: str, candidate: str, *, exact: bool = False) -> bool:
+    if _raw_model_matches(query, candidate, exact=exact):
+        return True
+    alias = RETIRED_MODEL_ALIASES.get(normalize_model(query))
+    if not alias:
+        return False
+    return _raw_model_matches(alias, candidate, exact=exact)
 
 
 def tencent_delivery_mode(display_name: str) -> str:
@@ -821,13 +862,23 @@ class TencentAdapter(PriceSource):
             rows = expand_slate_table(node)
             if not rows:
                 continue
-            headers = rows[0]
-            try:
-                name_index = next(i for i, h in enumerate(headers) if h == "模型名称")
+            headers = [clean_text(header) for header in rows[0]]
+            name_index = next(
+                (i for i, h in enumerate(headers) if "模型" in h),
+                None,
+            )
+            # The call-parameter column is labelled "model（调用参数）"; match it by
+            # wording rather than by exact punctuation.
+            id_index = next(
+                (i for i, h in enumerate(headers) if "调用参数" in h),
+                None,
+            )
+            if id_index is None:
                 id_index = next(
-                    i for i, h in enumerate(headers) if "model（调用参数）" in h
+                    (i for i, h in enumerate(headers) if "model" in h.lower()),
+                    None,
                 )
-            except StopIteration:
+            if name_index is None or id_index is None:
                 continue
             for row in rows[1:]:
                 if max(name_index, id_index) >= len(row):
@@ -856,9 +907,11 @@ class TencentAdapter(PriceSource):
         retrieved_at = now_iso()
         slate = extract_tencent_slate(self.client.get_text(TENCENT_PRICE_URL))
         offers_by_name: dict[str, list[dict[str, Any]]] = {}
-        for node in walk_objects(slate):
-            if node.get("type") != "tab" or node.get("name") != "广州":
-                continue
+        # Prefer the 广州 region tab, but fall back to any tab that carries price
+        # tables so a renamed or added region tab does not blank the provider.
+        tabs = [node for node in walk_objects(slate) if node.get("type") == "tab"]
+        region_tabs = [tab for tab in tabs if "广州" in str(tab.get("name", ""))] or tabs
+        for node in region_tabs:
             for child in walk_objects(node.get("children", [])):
                 if child.get("type") != "table":
                     continue
@@ -1027,19 +1080,31 @@ class DeepSeekAdapter(PriceSource):
     provider_name = "DeepSeek 原厂"
     source_url = DEEPSEEK_URL
     source_kind = "official_document"
+    model_header_prefix = "模型"
 
     def _table(self) -> list[list[str]]:
         parser = TextTableParser()
         parser.feed(self.client.get_text(DEEPSEEK_URL).replace("\x00", ""))
         table = next(
-            (t for t in parser.tables if t and t[0] and t[0][0] == "模型"), None
+            (
+                candidate
+                for candidate in parser.tables
+                if candidate
+                and candidate[0]
+                and normalize_model(candidate[0][0]).startswith(self.model_header_prefix)
+            ),
+            None,
         )
         if not table:
             raise SourceError("DeepSeek pricing table was not found")
         return table
 
+    def _models(self, table: list[list[str]]) -> list[str]:
+        # Model columns carry footnote markers such as "deepseek-flash(1)".
+        return [strip_footnote_markers(name) for name in table[0][1:]]
+
     def list_models(self, prefix: str = "") -> list[str]:
-        models = self._table()[0][1:]
+        models = self._models(self._table())
         if prefix:
             normalized = normalize_model(prefix)
             models = [m for m in models if normalize_model(m).startswith(normalized)]
@@ -1047,12 +1112,12 @@ class DeepSeekAdapter(PriceSource):
 
     def query(self, model: str) -> list[dict[str, Any]]:
         table = self._table()
-        models = table[0][1:]
+        models = self._models(table)
         try:
             model_index = next(
                 i
                 for i, item in enumerate(models)
-                if normalize_model(item) == normalize_model(model)
+                if model_key(item) == model_key(model)
             )
         except StopIteration:
             return []
@@ -1496,9 +1561,9 @@ class OpenAIAdapter(PriceSource):
         text = self.client.get_text(OPENAI_MARKDOWN_URL)
         rows: list[dict[str, Any]] = []
         for heading, table in markdown_tables(text):
-            tier_match = re.fullmatch(
-                r"(Standard|Batch|Flex|Fast) pricing data", heading
-            )
+            # Any "<Tier> pricing data" heading is a service tier, so a new tier
+            # name does not silently drop that tier's prices.
+            tier_match = re.fullmatch(r"([A-Za-z][A-Za-z-]*) pricing data", heading)
             if not tier_match or len(table) < 2:
                 continue
             headers = [clean_text(cell).lower() for cell in table[0]]
@@ -1608,13 +1673,18 @@ class AnthropicAdapter(PriceSource):
             cells += [""] * (6 - len(cells))
             display_name = markdown_link_text(cells[0])
             model_id = normalize_model(re.sub(r"\s*\([^)]*\)\s*$", "", display_name))
-            if not model_id.startswith("claude-"):
+            prices = [
+                item
+                for item in (
+                    usd_price(kind, label, value)
+                    for kind, label, value in zip(kinds, labels, cells[1:6])
+                )
+                if item
+            ]
+            # Rows are identified by pricing content, never by a name prefix, so a
+            # renamed or newly branded model family is picked up without a code fix.
+            if not model_id or not prices:
                 continue
-            prices = []
-            for kind, label, value in zip(kinds, labels, cells[1:6]):
-                item = usd_price(kind, label, value)
-                if item:
-                    prices.append(item)
             conditions: dict[str, Any] = {"service_tier": "standard"}
             status = re.search(
                 r"\(([^)]*(?:retired|limited availability)[^)]*)\)", display_name, re.I
@@ -1643,8 +1713,6 @@ class AnthropicAdapter(PriceSource):
                     model_id = normalize_model(
                         re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
                     )
-                    if not model_id.startswith("claude-"):
-                        continue
                     prices = [
                         item
                         for item in (
@@ -1653,6 +1721,8 @@ class AnthropicAdapter(PriceSource):
                         )
                         if item
                     ]
+                    if not model_id or not prices:
+                        continue
                     rows.append(
                         {
                             "model_id": model_id,
@@ -1702,6 +1772,22 @@ class AnthropicAdapter(PriceSource):
         ]
 
 
+NON_MODEL_SECTION_IDS = {"notes", "pricing-for-tools", "pricing-for-agents"}
+
+
+def is_model_section_id(heading_id: str) -> bool:
+    """A pricing section belongs to a model unless it is an overview section.
+
+    Matching every model slug (instead of a hard-coded family prefix) keeps new
+    families such as ``gemma-4`` or ``veo-3.1`` discoverable.
+    """
+    if not heading_id:
+        return False
+    if heading_id in NON_MODEL_SECTION_IDS:
+        return False
+    return not heading_id.startswith("pricing-for")
+
+
 class GeminiPricingParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -1724,7 +1810,7 @@ class GeminiPricingParser(HTMLParser):
             self.capture_text = []
             if tag == "h2":
                 heading_id = str(attributes.get("id", ""))
-                self.model_id = heading_id if heading_id.startswith("gemini-") else ""
+                self.model_id = heading_id if is_model_section_id(heading_id) else ""
                 self.display_name = ""
         if tag == "table" and "pricing-table" in str(attributes.get("class", "")):
             self.in_table = True
@@ -1928,7 +2014,9 @@ def inferred_overseas_providers(model: str) -> tuple[str, ...]:
         providers.append("openai")
     if re.search(r"(?:^|-)(?:anthropic|claude)(?:-|$)", key):
         providers.append("anthropic")
-    if re.search(r"(?:^|-)(?:google|gemini)(?:-|$)", key):
+    if re.search(
+        r"(?:^|-)(?:google|gemini|gemma|veo|lyria|imagen)(?:-|$)", key
+    ):
         providers.append("google")
     return tuple(providers)
 
@@ -2051,6 +2139,7 @@ def to_markdown(payload: dict[str, Any]) -> str:
             "third_party_hosted": "第三方托管",
             "first_party": "原厂",
         }
+        rows_written = 0
         for record in results:
             for offer in record.get("offers", []):
                 conditions = offer.get("conditions", {})
@@ -2079,6 +2168,12 @@ def to_markdown(payload: dict[str, Any]) -> str:
                         source=source,
                     )
                 )
+                rows_written += 1
+        if not rows_written:
+            lines.append(
+                "匹配到的模型存在，但官方文档未给出本工具可解析的价格"
+                "（例如按秒/按次计费或仅在免费档提供）。"
+            )
     else:
         lines.append("没有来源确认提供匹配的模型或版本。")
     lines.extend(["", "## 来源检查", ""])

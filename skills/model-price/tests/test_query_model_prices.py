@@ -277,5 +277,137 @@ class OverseasParserTests(unittest.TestCase):
         self.assertEqual(record["offers"][0]["prices"][0]["amount"], "0.50")
 
 
+DEEPSEEK_HTML = """
+<table>
+<tr><th>模型</th><th>deepseek-flash(1)</th><th>deepseek-v4-pro(2)</th></tr>
+<tr><td>模型版本</td><td>DeepSeek-V4.1-Flash</td><td>DeepSeek-V4-Pro-0813</td></tr>
+<tr><td>价格(3)</td><td>百万tokens输入 （缓存命中）</td><td>空闲时段</td><td>0.02元</td><td>0.15元</td></tr>
+<tr><td>高峰时段</td><td>0.04元</td><td>0.30元</td></tr>
+<tr><td>百万tokens输入 （缓存未命中）</td><td>空闲时段</td><td>1元</td><td>4.5元</td></tr>
+<tr><td>高峰时段</td><td>2元</td><td>9.0元</td></tr>
+<tr><td>百万tokens输出</td><td>空闲时段</td><td>4元</td><td>13.5元</td></tr>
+<tr><td>高峰时段</td><td>8元</td><td>27.0元</td></tr>
+</table>
+"""
+
+
+class DeepSeekAdapterTests(unittest.TestCase):
+    def adapter(self):
+        return MODULE.DeepSeekAdapter(
+            MappingClient({MODULE.DEEPSEEK_URL: DEEPSEEK_HTML})
+        )
+
+    def test_footnote_markers_do_not_break_the_catalog(self):
+        self.assertEqual(
+            self.adapter().list_models(), ["deepseek-flash", "deepseek-v4-pro"]
+        )
+
+    def test_prices_are_read_for_each_time_band(self):
+        record = self.adapter().query("deepseek-flash")[0]
+        self.assertEqual(record["model_id"], "deepseek-flash")
+        self.assertEqual(len(record["offers"]), 2)
+        off_peak = MODULE.price_lookup(record["offers"][0], "input")
+        self.assertEqual(off_peak["amount"], "1")
+        self.assertEqual(
+            MODULE.price_lookup(record["offers"][0], "cache_hit")["amount"], "0.02"
+        )
+        self.assertEqual(
+            MODULE.price_lookup(record["offers"][1], "output")["amount"], "8"
+        )
+
+    def test_retired_name_still_resolves_through_search(self):
+        records = self.adapter().search("deepseek-v4-flash")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["model_id"], "deepseek-flash")
+
+
+class ModelNameCouplingTests(unittest.TestCase):
+    def test_footnote_markers_are_not_part_of_model_identity(self):
+        self.assertEqual(
+            MODULE.strip_footnote_markers("deepseek-flash(1)"), "deepseek-flash"
+        )
+        self.assertEqual(
+            MODULE.strip_footnote_markers("deepseek-v4-pro（2）"), "deepseek-v4-pro"
+        )
+        self.assertEqual(MODULE.normalize_model("deepseek-flash(1)"), "deepseek-flash")
+
+    def test_retired_alias_adds_matches_without_losing_family_expansion(self):
+        self.assertTrue(MODULE.model_matches("deepseek-v4-flash", "deepseek-flash"))
+        self.assertTrue(
+            MODULE.model_matches("deepseek-v4-flash", "deepseek-v4-flash-0731")
+        )
+        self.assertFalse(MODULE.model_matches("deepseek-v4-flash", "deepseek-v4-pro"))
+
+    def test_anthropic_does_not_filter_rows_by_name_prefix(self):
+        markdown = """## Model pricing
+| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
+| --- | --- | --- | --- | --- | --- |
+| Anthropic Nova 1 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+"""
+        adapter = MODULE.AnthropicAdapter(
+            MappingClient({MODULE.ANTHROPIC_MARKDOWN_URL: markdown})
+        )
+        self.assertEqual(adapter.list_models(), ["anthropic-nova-1"])
+        record = adapter.query("anthropic-nova-1")[0]
+        self.assertEqual(record["offers"][0]["prices"][0]["amount"], "3")
+
+    def test_gemini_keeps_other_google_families_and_drops_overview_sections(self):
+        html = """<h2 id="gemma-4">Gemma 4</h2>
+<section><h3>Standard</h3><table class="pricing-table">
+<tr><th></th><th>Free Tier</th><th>Paid Tier, per 1M tokens in USD</th></tr>
+<tr><td>Input price</td><td>Free</td><td>$0.10</td></tr>
+</table></section>
+<h2 id="pricing-for-tools">Pricing for tools</h2>
+<section><h3>Standard</h3><table class="pricing-table">
+<tr><th></th><th>Free Tier</th><th>Paid Tier, per 1M tokens in USD</th></tr>
+<tr><td>Input price</td><td>Free</td><td>$9.99</td></tr>
+</table></section>"""
+        adapter = MODULE.GeminiAdapter(MappingClient({MODULE.GEMINI_URL: html}))
+        self.assertEqual(adapter.list_models(), ["gemma-4"])
+        record = adapter.query("gemma-4")[0]
+        self.assertEqual(record["offers"][0]["prices"][0]["amount"], "0.10")
+        self.assertEqual(adapter.query("pricing-for-tools"), [])
+
+    def test_google_family_names_route_to_the_google_source(self):
+        self.assertEqual(MODULE.inferred_overseas_providers("gemma-4"), ("google",))
+        self.assertEqual(MODULE.inferred_overseas_providers("veo-3.1"), ("google",))
+
+    def test_openai_accepts_any_pricing_tier_heading(self):
+        markdown = """### Priority pricing data
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-test | $2.00 | $0.20 | - | $8.00 | $4.00 | $0.40 | - | $12.00 |
+"""
+        adapter = MODULE.OpenAIAdapter(
+            MappingClient({MODULE.OPENAI_MARKDOWN_URL: markdown})
+        )
+        record = adapter.query("gpt-test")[0]
+        self.assertEqual(record["offers"][0]["name"], "priority")
+
+
+class MarkdownRenderingTests(unittest.TestCase):
+    def test_matched_model_without_parseable_prices_is_explained(self):
+        payload = {
+            "query": "veo-3.1",
+            "retrieved_at": "2026-09-11T00:00:00+08:00",
+            "results": [
+                {
+                    "provider": {"id": "google", "name": "Google Gemini"},
+                    "model_id": "veo-3.1",
+                    "display_name": "Veo 3.1",
+                    "region": "全球",
+                    "offers": [],
+                    "source": {
+                        "url": "https://example.test/pricing",
+                        "kind": "official_html",
+                        "retrieved_at": "2026-09-11T00:00:00+08:00",
+                    },
+                }
+            ],
+            "source_checks": [],
+        }
+        self.assertIn("未给出本工具可解析的价格", MODULE.to_markdown(payload))
+
+
 if __name__ == "__main__":
     unittest.main()
